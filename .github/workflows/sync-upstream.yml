@@ -32,14 +32,13 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          # 用 PAT 检出，使后续 git push 走 PAT（能推 workflow 文件）；无 SYNC_PAT 时回退 GITHUB_TOKEN
-          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
-          persist-credentials: true
+          # 仅用于检出；push 由下一步显式用 SYNC_PAT 完成
+          persist-credentials: false
 
       - name: Check breaking update policy
         id: breaking_guard
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
           UPSTREAM_BRANCH: main
           ALLOW_BREAKING_UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_breaking_update == true }}
@@ -48,25 +47,38 @@ jobs:
       - name: Sync upstream changes
         id: sync
         if: steps.breaking_guard.outputs.blocked != 'true'
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          # 优先用带 workflow 写权限的 PAT（GITHUB_TOKEN 无法推送 .github/workflows 变更）；未配置 SYNC_PAT 时回退 GITHUB_TOKEN
-          target_repo_token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
-          test_mode: false
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+          UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
+        run: |
+          set -euo pipefail
+          if [ -z "${SYNC_PAT:-}" ]; then
+            echo "::error::SYNC_PAT is not configured. GITHUB_TOKEN cannot push workflow files, so the sync is refused rather than silently falling back."
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+          git checkout main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          git push "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
 
       - name: Complete breaking update notices
         if: steps.sync.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
         run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
 
       - name: Trigger Worker deploy
         if: steps.sync.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
         run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
 
       - name: Sync failure guidance
@@ -75,14 +87,9 @@ jobs:
           {
             echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
             echo
-            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
+            echo "推送使用了 SYNC_PAT。若仍失败，请确认该 PAT 未过期且具备 \`repo\` 与 \`workflow\` 权限；上游改动 workflow 文件时，缺少 \`workflow\` 权限会被拒绝。"
             echo
-            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
-            echo
-            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
-            echo
-            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
+            echo "The push uses SYNC_PAT. If it still fails, verify the PAT is valid and has both \`repo\` and \`workflow\` scopes; GitHub rejects workflow-file updates without \`workflow\`."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
-          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
+          echo "[Error] 上游同步未能完成；请检查 SYNC_PAT 的 repo/workflow 权限。" >&2
           exit 1
